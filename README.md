@@ -29,21 +29,21 @@ Most "smart city AI" submissions are a chatbot wrapped around a dashboard. NARAD
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     REACT DASHBOARD (Vite + Tailwind)            │
-│   Live Metrics · Agent Parliament UI · Scenario Simulator ·      │
-│   RAPIDS Benchmark · Real-time Trends · Alert Feed               │
-└───────────────────────────┬───────────────────────────────────────┘
-                            │ WebSocket + REST
-┌───────────────────────────▼───────────────────────────────────────┐
-│                    FASTAPI BACKEND (Cloud Run)                    │
-│  ┌─────────────┐  ┌──────────────────┐  ┌──────────────────────┐ │
-│  │ Live Data    │  │  Agent Parliament │  │  NVIDIA RAPIDS       │ │
-│  │ Feeds        │──▶  5 ADK Agents     │  │  Engine               │ │
-│  │ (Weather/    │  │  (Gemini 2.0)     │  │  (cuDF/cuPy + CPU    │ │
-│  │  AQI/Traffic/│  │  Vote → Consensus │  │   fallback)           │ │
-│  │  Hospital/   │  │  → Dissent Log →  │  │  Monte Carlo          │ │
-│  │  Safety/Econ)│  │  Causal Chain     │  │  Simulation            │ │
-│  └─────────────┘  └──────────────────┘  └──────────────────────┘ │
+│                 REACT DASHBOARD (Vite + Tailwind)               │
+│     Live Metrics · Agent Parliament UI · Scenario Simulator     │
+│         RAPIDS Benchmark · Real-time Trends · Alert Feed        │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │ WebSocket + REST
+┌───────────────────────────────▼─────────────────────────────────┐
+│                  FASTAPI BACKEND (Cloud Run)                    │
+│  ┌──────────────┐   ┌──────────────────┐  ┌──────────────────┐  │
+│  │ Live Data    │   │ Agent Parliament │  │ NVIDIA RAPIDS    │  │
+│  │ Feeds        │──▶│ 5 ADK Agents     │  │ Engine           │  │
+│  │ (Weather/    │   │ (Gemini 2.0)     │  │ (cuDF/cuPy + CPU │  │
+│  │  AQI/Traffic/│   │ Vote → Consensus │  │  fallback)       │  │
+│  │  Hospital/   │   │ → Dissent Log →  │  │ Monte Carlo      │  │
+│  │  Safety/Econ)│   │ Causal Chain     │  │ Simulation       │  │
+│  └──────────────┘   └──────────────────┘  └──────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
