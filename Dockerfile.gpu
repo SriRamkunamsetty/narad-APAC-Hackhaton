@@ -1,0 +1,45 @@
+# ═══════════════════════════════════════════════════════════════════════
+# NARAD — GPU-Accelerated Dockerfile (NVIDIA RAPIDS / cuDF)
+# For deployment on Cloud Run with NVIDIA L4 GPU attached, or GKE with
+# NVIDIA GPU node pools. Base image includes CUDA runtime + RAPIDS.
+#
+# Deploy with:
+#   gcloud run deploy narad-gpu --image=<built-image> \
+#     --gpu=1 --gpu-type=nvidia-l4 --region=us-central1 \
+#     --memory=16Gi --cpu=4 --no-cpu-throttling
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Stage 1: Frontend build (same as CPU version) ──────────────────────
+FROM node:20-slim AS frontend-build
+WORKDIR /app/frontend
+COPY frontend/package.json ./
+RUN npm install --silent
+COPY frontend/ ./
+RUN npm run build
+
+# ── Stage 2: RAPIDS base image with Python backend ──────────────────────
+FROM nvcr.io/nvidia/rapidsai/base:24.10-cuda12.5-py3.11 AS backend
+
+WORKDIR /app
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY backend/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ ./backend/
+COPY --from=frontend-build /app/frontend/dist ./static
+
+ENV SERVE_STATIC=true
+ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
+ENV USE_GPU=true
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -f http://localhost:8080/api/health || exit 1
+
+CMD ["python3", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

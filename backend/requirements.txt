@@ -1,0 +1,23 @@
+# NARAD Backend Dependencies
+# Core web framework
+fastapi==0.139.0
+uvicorn[standard]==0.49.0
+websockets==15.0.1
+python-multipart==0.0.32
+sse-starlette==3.4.5
+
+# Google AI / ADK
+google-adk==2.3.0
+google-genai==2.10.0
+google-generativeai==0.8.6
+
+# Data processing (CPU fallback — RAPIDS/cuDF installed separately on GPU images)
+numpy==2.4.4
+pandas>=2.2.0
+
+# HTTP client for live data feeds
+httpx==0.28.1
+
+# Config & validation
+pydantic==2.13.4
+python-dotenv==1.2.2

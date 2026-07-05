@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #05070A;
+  color: #E8EDF2;
+  font-family: 'Inter', sans-serif;
+  overflow-x: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0B0F14;
+}
+::-webkit-scrollbar-thumb {
+  background: #1C2530;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2A3644;
+}
+
+.bg-grid {
+  background-image:
+    linear-gradient(rgba(28, 37, 48, 0.4) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(28, 37, 48, 0.4) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.font-mono-nums {
+  font-family: 'JetBrains Mono', monospace;
+  font-feature-settings: "tnum";
+}
+
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-in {
+  animation: fadeSlideIn 0.4s ease-out both;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.animate-blink {
+  animation: blink 1.6s ease-in-out infinite;
+}
