@@ -11,19 +11,25 @@ from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Dict, List, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.config import APP_NAME, APP_VERSION, DEFAULT_CITY, PARLIAMENT_INTERVAL, DATA_REFRESH_INTERVAL
+from backend.config import (
+    APP_NAME, APP_VERSION, DEFAULT_CITY, PARLIAMENT_INTERVAL, DATA_REFRESH_INTERVAL,
+    ALLOWED_ORIGINS
+)
 from backend.data.live_feeds import fetch_city_pulse
 from backend.data.rapids_engine import (
     run_benchmark, evaluate_scenario, detect_anomalies, GPU_AVAILABLE
 )
 from backend.agents.parliament import run_parliament_session
+from backend.agents.concierge import ask_narad
+from backend.data import bigquery_store
+from backend.security import verify_api_key, rate_limiter, audit_log_action
 from backend.models.schemas import (
-    ScenarioRequest, WSMessage, WSEventType, CityPulse, ParliamentDecision, ManualHospitalReport
+    ScenarioRequest, WSMessage, WSEventType, CityPulse, ParliamentDecision, ManualHospitalReport, AskRequest
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(levelname)s | %(message)s")
@@ -72,7 +78,10 @@ async def data_refresh_loop():
                 "hospital_load": pulse.hospitals.capacity_percent,
                 "incidents": pulse.safety.active_incidents,
             })
-            state.pulse_history = state.pulse_history[-200:]  # keep last 200 points
+            state.pulse_history = state.pulse_history[-200:]  # in-memory buffer (fast, always available)
+
+            # Persist to BigQuery for real historical analysis (no-op if unavailable)
+            bigquery_store.insert_pulse_snapshot(pulse)
 
             await broadcast(WSMessage(type=WSEventType.CITY_PULSE, payload=pulse.model_dump(mode="json")))
 
@@ -110,7 +119,10 @@ async def trigger_parliament(trigger: str):
         decision = await run_parliament_session(state.current_pulse, trigger)
         state.latest_decision = decision
         state.decision_history.append(decision)
-        state.decision_history = state.decision_history[-20:]  # keep last 20
+        state.decision_history = state.decision_history[-20:]  # in-memory buffer
+
+        # Persist to BigQuery for real historical analysis (no-op if unavailable)
+        bigquery_store.insert_parliament_decision(decision)
 
         await broadcast(WSMessage(type=WSEventType.PARLIAMENT_END, payload=decision.model_dump(mode="json")))
     except Exception as e:
@@ -121,6 +133,10 @@ async def trigger_parliament(trigger: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"🚀 {APP_NAME} v{APP_VERSION} starting — GPU: {'✅ ACTIVE' if GPU_AVAILABLE else '⚠️ CPU fallback'}")
+
+    # Attempt BigQuery connection — falls back to in-memory storage if unavailable
+    bigquery_store.init_bigquery()
+
     # Warm up: fetch initial data
     try:
         state.current_pulse = await fetch_city_pulse(DEFAULT_CITY)
@@ -139,11 +155,22 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Basic security headers on every response. Defense-in-depth, not a
+    substitute for a real security review."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
 
 # ─── REST Endpoints ─────────────────────────────────────────────────────────────
@@ -196,8 +223,29 @@ async def get_city_pulse():
 
 
 @app.get("/api/city-pulse/history")
-async def get_pulse_history():
-    return {"history": state.pulse_history}
+async def get_pulse_history(hours: int = 24):
+    """
+    Historical city pulse data. Queries BigQuery for real persistent history
+    when available; falls back to the in-memory rolling buffer (last ~200
+    points, reset on restart) otherwise.
+    """
+    if bigquery_store.BIGQUERY_AVAILABLE:
+        bq_history = bigquery_store.query_pulse_history(hours=hours, city=DEFAULT_CITY)
+        if bq_history:
+            return {
+                "history": [
+                    {
+                        "timestamp": row["timestamp"].isoformat() if hasattr(row["timestamp"], "isoformat") else row["timestamp"],
+                        "aqi": row["aqi"],
+                        "congestion": row["congestion"],
+                        "hospital_load": row["hospital_load"],
+                        "incidents": row["incidents"],
+                    }
+                    for row in bq_history
+                ],
+                "source": "bigquery",
+            }
+    return {"history": state.pulse_history, "source": "in_memory_buffer"}
 
 
 @app.get("/api/parliament/latest")
@@ -208,20 +256,44 @@ async def get_latest_decision():
 
 
 @app.get("/api/parliament/history")
-async def get_decision_history():
-    return {"decisions": [d.model_dump(mode="json") for d in state.decision_history]}
+async def get_decision_history(limit: int = 20):
+    """
+    Historical parliament decisions. Queries BigQuery for real persistent
+    history when available; falls back to the in-memory buffer (last 20,
+    reset on restart) otherwise.
+    """
+    if bigquery_store.BIGQUERY_AVAILABLE:
+        bq_decisions = bigquery_store.query_recent_decisions(limit=limit, city=DEFAULT_CITY)
+        if bq_decisions:
+            return {
+                "decisions": [json.loads(row["raw_json"]) for row in bq_decisions if row.get("raw_json")],
+                "source": "bigquery",
+            }
+    return {
+        "decisions": [d.model_dump(mode="json") for d in state.decision_history],
+        "source": "in_memory_buffer",
+    }
 
 
 @app.post("/api/parliament/trigger")
-async def manual_trigger(reason: str = "Manual trigger by user"):
-    """Manually trigger a parliament session"""
+async def manual_trigger(
+    reason: str = "Manual trigger by user",
+    request: Request = None,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Manually trigger a parliament session. Requires an API key — each session
+    costs 5 Gemini calls, so this is gated to prevent abuse/cost drain.
+    """
+    client_ip = request.client.host if request and request.client else "unknown"
+    audit_log_action("parliament_trigger", identity=f"api_key:{api_key[:6]}...", details={"reason": reason}, client_ip=client_ip)
     asyncio.create_task(trigger_parliament(reason))
     return {"status": "triggered", "reason": reason}
 
 
-@app.post("/api/scenario/simulate")
+@app.post("/api/scenario/simulate", dependencies=[Depends(rate_limiter(max_requests=20, window_seconds=60))])
 async def simulate_scenario(request: ScenarioRequest):
-    """Run a what-if scenario simulation using NVIDIA RAPIDS"""
+    """Run a what-if scenario simulation using NVIDIA RAPIDS. Rate-limited (compute cost)."""
     if state.current_pulse is None:
         raise HTTPException(503, "City data not available")
 
@@ -234,6 +306,26 @@ async def simulate_scenario(request: ScenarioRequest):
 
     outcome = await evaluate_scenario(request, city_state)
     return outcome.model_dump(mode="json")
+
+
+@app.post("/api/ask", dependencies=[Depends(rate_limiter(max_requests=15, window_seconds=60))])
+async def ask_narad_endpoint(request: AskRequest):
+    """
+    Ask NARAD a free-form question in natural language (English, Hindi, or
+    Telugu) about current city conditions. Grounded in live city pulse +
+    latest parliament decision, plus BigQuery historical context when available.
+    Rate-limited — each call costs a Gemini request.
+    """
+    if request.language not in ("english", "hindi", "telugu"):
+        raise HTTPException(400, "language must be one of: english, hindi, telugu")
+
+    result = await ask_narad(
+        question=request.question,
+        language=request.language,
+        pulse=state.current_pulse,
+        decision=state.latest_decision,
+    )
+    return result
 
 
 @app.get("/api/benchmark")
@@ -269,14 +361,32 @@ async def get_stats():
 # changes — just a parallel store + endpoint.
 
 @app.post("/api/manual-data/hospital")
-async def submit_hospital_status(report: ManualHospitalReport):
+async def submit_hospital_status(
+    report: ManualHospitalReport,
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+):
     """
     A hospital self-reports its current status. This becomes real data
     immediately — no external API needed. Triggers an instant broadcast so
     the dashboard reflects it without waiting for the next refresh cycle.
+    Requires an API key: this directly affects data other agents and
+    officials will rely on, so it must not be open to anonymous submission.
     """
     from backend.data.manual_reports import submit_hospital_report
     saved = submit_hospital_report(report)
+
+    client_ip = request.client.host if request.client else "unknown"
+    audit_log_action(
+        "hospital_report_submit",
+        identity=report.reported_by or f"api_key:{api_key[:6]}...",
+        details={
+            "hospital_name": report.hospital_name,
+            "available_beds": report.available_beds,
+            "icu_available": report.icu_available,
+        },
+        client_ip=client_ip,
+    )
 
     # Refresh city pulse immediately so the new report is reflected right away
     try:
@@ -291,7 +401,7 @@ async def submit_hospital_status(report: ManualHospitalReport):
 
 @app.get("/api/manual-data/hospital")
 async def list_hospital_reports(fresh_only: bool = True):
-    """List currently self-reporting hospitals (for an admin/status view)"""
+    """List currently self-reporting hospitals (for an admin/status view) — read-only, no auth required"""
     from backend.data.manual_reports import get_fresh_hospital_reports, get_all_hospital_reports, MANUAL_REPORT_FRESHNESS_MINUTES
     reports = get_fresh_hospital_reports() if fresh_only else get_all_hospital_reports()
     return {
@@ -301,12 +411,24 @@ async def list_hospital_reports(fresh_only: bool = True):
 
 
 @app.delete("/api/manual-data/hospital/{hospital_name}")
-async def remove_hospital_report(hospital_name: str):
-    """Remove a hospital's self-report (e.g. to correct a mistaken entry)"""
+async def remove_hospital_report(
+    hospital_name: str,
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+):
+    """Remove a hospital's self-report (e.g. to correct a mistaken entry). Requires an API key."""
     from backend.data.manual_reports import delete_hospital_report
     removed = delete_hospital_report(hospital_name)
     if not removed:
         raise HTTPException(404, f"No report found for '{hospital_name}'")
+
+    client_ip = request.client.host if request.client else "unknown"
+    audit_log_action(
+        "hospital_report_delete",
+        identity=f"api_key:{api_key[:6]}...",
+        details={"hospital_name": hospital_name},
+        client_ip=client_ip,
+    )
 
     # Refresh immediately so the correction is reflected without waiting for
     # the next scheduled refresh cycle — same behavior as submitting a report.
@@ -344,7 +466,26 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 msg = json.loads(data)
                 if msg.get("type") == "trigger_parliament":
-                    asyncio.create_task(trigger_parliament(msg.get("reason", "User requested via WebSocket")))
+                    # SECURITY: this WebSocket path previously bypassed the API
+                    # key check applied to the REST /api/parliament/trigger
+                    # endpoint entirely — same protection is required here,
+                    # since both paths trigger the same costly 5-agent session.
+                    from backend.config import NARAD_ADMIN_API_KEY
+                    supplied_key = msg.get("api_key", "")
+                    if not NARAD_ADMIN_API_KEY or supplied_key != NARAD_ADMIN_API_KEY:
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "payload": {"message": "Invalid or missing access key for parliament trigger"}
+                        }))
+                    else:
+                        client_ip = websocket.client.host if websocket.client else "unknown"
+                        audit_log_action(
+                            "parliament_trigger_ws",
+                            identity=f"api_key:{supplied_key[:6]}...",
+                            details={"reason": msg.get("reason", "User requested via WebSocket")},
+                            client_ip=client_ip,
+                        )
+                        asyncio.create_task(trigger_parliament(msg.get("reason", "User requested via WebSocket")))
                 elif msg.get("type") == "ping":
                     await websocket.send_text(json.dumps({"type": "pong"}))
             except json.JSONDecodeError:
@@ -451,6 +592,31 @@ async def diagnose_traffic():
         diagnosis["error"] = f"{type(e).__name__}: {str(e)}"
 
     return diagnosis
+
+
+@app.get("/api/diagnostics/bigquery")
+async def diagnose_bigquery():
+    """
+    Test whether BigQuery is actually connected and storing data, or if the
+    system is running on the in-memory fallback buffer instead.
+    """
+    status = bigquery_store.get_status()
+    if status["available"]:
+        status["note"] = (
+            f"Connected. Historical pulse + parliament decisions are being "
+            f"persisted to `{status['project']}.{status['dataset']}` — "
+            f"queryable across restarts, unlike the in-memory buffer."
+        )
+    else:
+        status["note"] = (
+            "Not connected — history endpoints are serving the in-memory "
+            "buffer (last ~200 pulse points / 20 decisions, reset on restart). "
+            "To enable: set GCP_PROJECT_ID to a real project with the BigQuery "
+            "API enabled, and ensure Application Default Credentials are "
+            "available (gcloud auth application-default login locally, or the "
+            "Cloud Run service account in production)."
+        )
+    return status
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ if GEMINI_API_KEY:
     os.environ.setdefault("GOOGLE_API_KEY", GEMINI_API_KEY)
 
 # ─── Google Cloud ─────────────────────────────────────────────────────────────
-GCP_PROJECT_ID      = os.getenv("GCP_PROJECT_ID", "narad-city-ai")
+GCP_PROJECT_ID      = os.getenv("GCP_PROJECT_ID", "")
 GCP_REGION          = os.getenv("GCP_REGION", "us-central1")
 BIGQUERY_DATASET    = os.getenv("BIGQUERY_DATASET", "narad_city_data")
 
@@ -46,3 +46,20 @@ DATA_REFRESH_INTERVAL = int(os.getenv("DATA_REFRESH_INTERVAL", "30"))
 # ─── RAPIDS / GPU ─────────────────────────────────────────────────────────────
 USE_GPU             = os.getenv("USE_GPU", "auto")  # auto | true | false
 SCENARIO_COUNT      = int(os.getenv("SCENARIO_COUNT", "1000"))
+
+# ─── Security ─────────────────────────────────────────────────────────────────
+# Required for any data-mutating endpoint (hospital reports, parliament
+# trigger). If unset, those endpoints refuse requests (fail closed).
+NARAD_ADMIN_API_KEY = os.getenv("NARAD_ADMIN_API_KEY", "")
+
+# Comma-separated list of origins allowed to call the API cross-origin.
+# Does NOT affect same-origin use (the dashboard calling its own backend on
+# Cloud Run works regardless — CORS only governs *other* sites calling this
+# API from a browser). Defaults to local dev only; update after your first
+# Cloud Run deploy to include the assigned service URL if you need
+# cross-origin access from elsewhere.
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv(
+        "ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:8080"
+    ).split(",") if o.strip()
+]

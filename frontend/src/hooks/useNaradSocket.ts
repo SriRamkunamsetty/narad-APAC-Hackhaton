@@ -10,7 +10,8 @@ interface UseNaradSocket {
   decision: ParliamentDecision | null
   alerts: string[]
   parliamentRunning: boolean
-  triggerParliament: (reason: string) => void
+  triggerParliament: (reason: string, accessKey: string) => void
+  lastError: string | null
 }
 
 export function useNaradSocket(): UseNaradSocket {
@@ -19,6 +20,7 @@ export function useNaradSocket(): UseNaradSocket {
   const [decision, setDecision] = useState<ParliamentDecision | null>(null)
   const [alerts, setAlerts] = useState<string[]>([])
   const [parliamentRunning, setParliamentRunning] = useState(false)
+  const [lastError, setLastError] = useState<string | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const retryRef = useRef(0)
 
@@ -52,6 +54,10 @@ export function useNaradSocket(): UseNaradSocket {
           case 'alert':
             setAlerts(prev => [msg.payload.message, ...prev].slice(0, 20))
             break
+          case 'error':
+            setLastError(msg.payload?.message || 'Unknown error')
+            setParliamentRunning(false)
+            break
         }
       } catch (e) {
         // ignore pong / malformed
@@ -75,11 +81,11 @@ export function useNaradSocket(): UseNaradSocket {
     return () => wsRef.current?.close()
   }, [connect])
 
-  const triggerParliament = useCallback((reason: string) => {
+  const triggerParliament = useCallback((reason: string, accessKey: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'trigger_parliament', reason }))
+      wsRef.current.send(JSON.stringify({ type: 'trigger_parliament', reason, api_key: accessKey }))
     }
   }, [])
 
-  return { connected, cityPulse, decision, alerts, parliamentRunning, triggerParliament }
+  return { connected, cityPulse, decision, alerts, parliamentRunning, triggerParliament, lastError }
 }

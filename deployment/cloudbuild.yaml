@@ -1,7 +1,13 @@
 # ═══════════════════════════════════════════════════════════════════════
 # NARAD — Google Cloud Build → Cloud Run deployment pipeline
-# Usage: gcloud builds submit --config cloudbuild.yaml \
-#          --substitutions=_GEMINI_API_KEY="your_key_here",_GOOGLE_MAPS_API_KEY="optional_maps_key"
+#
+# Secrets (Gemini key, Maps key, admin API key) are read from Secret Manager
+# at deploy time via --set-secrets, NOT passed as plain substitutions here —
+# substitutions can appear in Cloud Build logs/history, which is not
+# appropriate for real credentials. deploy.sh creates these secrets before
+# triggering this build. Usage: run deployment/deploy.sh, don't call this
+# file directly unless you've already created the three secrets yourself:
+#   narad-gemini-key, narad-maps-key, narad-admin-key
 # ═══════════════════════════════════════════════════════════════════════
 steps:
   # ── Build the container image ─────────────────────────────────────────
@@ -38,7 +44,8 @@ steps:
       - '--max-instances=10'
       - '--timeout=300'
       - '--port=8080'
-      - '--set-env-vars=GEMINI_API_KEY=${_GEMINI_API_KEY},GEMINI_MODEL=${_GEMINI_MODEL},DEFAULT_CITY=${_DEFAULT_CITY},SERVE_STATIC=true,GOOGLE_MAPS_API_KEY=${_GOOGLE_MAPS_API_KEY}'
+      - '--set-env-vars=GEMINI_MODEL=${_GEMINI_MODEL},DEFAULT_CITY=${_DEFAULT_CITY},SERVE_STATIC=true,GCP_PROJECT_ID=${PROJECT_ID},BIGQUERY_DATASET=${_BIGQUERY_DATASET},ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}'
+      - '--set-secrets=GEMINI_API_KEY=narad-gemini-key:latest,GOOGLE_MAPS_API_KEY=narad-maps-key:latest,NARAD_ADMIN_API_KEY=narad-admin-key:latest'
 
 images:
   - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE_NAME}:${SHORT_SHA}'
@@ -50,8 +57,11 @@ substitutions:
   _REPO: narad-repo
   _GEMINI_MODEL: gemini-2.0-flash
   _DEFAULT_CITY: Hyderabad
-  _GEMINI_API_KEY: ""  # pass via --substitutions at submit time
-  _GOOGLE_MAPS_API_KEY: ""  # optional — enables real live traffic data
+  _BIGQUERY_DATASET: narad_city_data
+  # Comma-separated allowed CORS origins. "*" works for a demo but is not
+  # recommended for production — update after first deploy with the real
+  # Cloud Run URL (deploy.sh prints the exact command to do this).
+  _ALLOWED_ORIGINS: "*"
 
 options:
   logging: CLOUD_LOGGING_ONLY

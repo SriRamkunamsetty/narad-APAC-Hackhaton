@@ -7,13 +7,16 @@ import BenchmarkCard from './components/BenchmarkCard'
 import TrendChart from './components/TrendChart'
 import AlertsFeed from './components/AlertsFeed'
 import HospitalReportForm from './components/HospitalReportForm'
+import AskNarad from './components/AskNarad'
 import { useNaradSocket } from './hooks/useNaradSocket'
+import { useAccessKey } from './hooks/useAccessKey'
 import { api } from './utils/api'
 import type { PulseHistoryPoint } from './types'
 
 export default function App() {
-  const { connected, cityPulse, decision, alerts, parliamentRunning, triggerParliament } = useNaradSocket()
+  const { connected, cityPulse, decision, alerts, parliamentRunning, triggerParliament, lastError } = useNaradSocket()
   const [history, setHistory] = useState<PulseHistoryPoint[]>([])
+  const [accessKey] = useAccessKey()
 
   useEffect(() => {
     const poll = async () => {
@@ -42,12 +45,16 @@ export default function App() {
 
         <CityPulseGrid pulse={cityPulse} />
 
+        <AskNarad />
+
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
           <div className="lg:col-span-2 space-y-5">
             <AgentParliament
               decision={decision}
               running={parliamentRunning}
-              onTrigger={() => triggerParliament('Manual trigger from dashboard')}
+              error={lastError}
+              hasAccessKey={!!accessKey.trim()}
+              onTrigger={() => triggerParliament('Manual trigger from dashboard', accessKey)}
             />
             <TrendChart history={history} />
           </div>

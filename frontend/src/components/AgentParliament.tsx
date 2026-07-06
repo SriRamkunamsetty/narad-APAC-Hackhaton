@@ -6,6 +6,8 @@ interface Props {
   decision: ParliamentDecision | null
   running: boolean
   onTrigger: () => void
+  error?: string | null
+  hasAccessKey?: boolean
 }
 
 const voteConfig: Record<VoteDecision, { icon: React.ReactNode; color: string; label: string }> = {
@@ -72,7 +74,7 @@ function AgentCard({ stance }: { stance: AgentStance }) {
   )
 }
 
-export default function AgentParliament({ decision, running, onTrigger }: Props) {
+export default function AgentParliament({ decision, running, onTrigger, error, hasAccessKey }: Props) {
   return (
     <div className="bg-surface border border-line rounded-xl p-5">
       <div className="flex items-center justify-between mb-4">
@@ -83,15 +85,26 @@ export default function AgentParliament({ decision, running, onTrigger }: Props)
           </h2>
           <p className="text-[11px] text-inkdim mt-0.5">5 autonomous ADK agents · independent analysis · transparent voting</p>
         </div>
-        <button
-          onClick={onTrigger}
-          disabled={running}
-          className="text-xs font-medium px-3.5 py-1.5 rounded-md bg-signal/10 border border-signal/30 text-signal hover:bg-signal/20 transition-colors disabled:opacity-50 flex items-center gap-1.5"
-        >
-          {running ? <Loader2 size={13} className="animate-spin" /> : <GitBranch size={13} />}
-          {running ? 'Deliberating...' : 'Convene Session'}
-        </button>
+        <div className="text-right">
+          <button
+            onClick={onTrigger}
+            disabled={running}
+            className="text-xs font-medium px-3.5 py-1.5 rounded-md bg-signal/10 border border-signal/30 text-signal hover:bg-signal/20 transition-colors disabled:opacity-50 flex items-center gap-1.5"
+          >
+            {running ? <Loader2 size={13} className="animate-spin" /> : <GitBranch size={13} />}
+            {running ? 'Deliberating...' : 'Convene Session'}
+          </button>
+          {!hasAccessKey && (
+            <p className="text-[10px] text-inkdim mt-1">Needs an access key — set one in Hospital Status Reporting</p>
+          )}
+        </div>
       </div>
+
+      {error && (
+        <div className="text-[11px] text-crit bg-crit/5 border border-crit/20 rounded-md px-3 py-2 mb-3">
+          {error}
+        </div>
+      )}
 
       {!decision && !running && (
         <div className="text-center py-12 text-inkdim text-sm">

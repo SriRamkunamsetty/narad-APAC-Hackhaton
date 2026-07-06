@@ -75,12 +75,12 @@ class HospitalData(BaseModel):
 
 class ManualHospitalReport(BaseModel):
     """A hospital self-reporting its own live status — no external API needed."""
-    hospital_name: str
-    available_beds: int
-    icu_available: int
-    ambulances_active: int = 0
-    emergency_wait_minutes: float = 15.0
-    reported_by: Optional[str] = None       # e.g. staff name/role, optional
+    hospital_name: str = Field(..., min_length=1, max_length=200)
+    available_beds: int = Field(..., ge=0, le=10000)
+    icu_available: int = Field(..., ge=0, le=2000)
+    ambulances_active: int = Field(default=0, ge=0, le=500)
+    emergency_wait_minutes: float = Field(default=15.0, ge=0, le=1440)
+    reported_by: Optional[str] = Field(default=None, max_length=200)       # e.g. staff name/role, optional
     reported_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class SafetyData(BaseModel):
@@ -156,8 +156,8 @@ class ParliamentSession(BaseModel):
 # ─── Scenario Simulation ──────────────────────────────────────────────────────
 
 class ScenarioRequest(BaseModel):
-    name: str
-    description: str
+    name: str = Field(..., max_length=200)
+    description: str = Field(..., max_length=500)
     parameters: Dict[str, Any]    # e.g. {"close_road": "NH-44", "duration_hours": 3}
     scenario_count: int = Field(default=500, le=2000)
 
@@ -190,6 +190,11 @@ class AnalysisRequest(BaseModel):
     city: str = "Hyderabad"
     query: str
     priority_domains: Optional[List[str]] = None  # which agents to prioritize
+    language: str = "english"  # english | hindi | telugu
+
+
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=1000)
     language: str = "english"  # english | hindi | telugu
 
 
