@@ -151,13 +151,26 @@ async def _run_single_agent(agent_name: AgentName, pulse: CityPulse, trigger: st
         content = genai_types.Content(role="user", parts=[genai_types.Part(text=prompt)])
 
         final_text = ""
-        async for event in runner.run_async(
-            user_id=user_id, session_id=session_id, new_message=content
-        ):
-            if hasattr(event, "content") and event.content and event.content.parts:
-                for part in event.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        final_text += part.text
+        try:
+            # Add timeout protection to prevent indefinite hangs
+            run_coro = runner.run_async(
+                user_id=user_id, session_id=session_id, new_message=content
+            )
+            # wait_for works on async generators in 3.11+, but actually run_async returns an async generator.
+            # To apply timeout to the whole generation:
+            async def _consume():
+                text = ""
+                async for event in run_coro:
+                    if hasattr(event, "content") and event.content and event.content.parts:
+                        for part in event.content.parts:
+                            if hasattr(part, "text") and part.text:
+                                text += part.text
+                return text
+            
+            final_text = await asyncio.wait_for(_consume(), timeout=20.0)
+        finally:
+            # Fix ADK session memory leak
+            await _session_service.delete_session(session_id)
 
         parsed = _extract_json(final_text)
 

@@ -254,9 +254,35 @@ Every write endpoint fails **closed**, not open — if `NARAD_ADMIN_API_KEY` isn
 | Rate limiting (per-IP) | `/api/ask` (15/min), `/api/scenario/simulate` (20/min) | Cost/abuse from repeated Gemini or compute-heavy calls |
 | Input validation (Pydantic `Field` constraints) | All write payloads | Negative bed counts, oversized strings, malformed numeric input |
 | Restricted CORS | All endpoints | Arbitrary third-party websites making cross-origin requests against the API |
-| Security headers | All responses | `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` |
+| Security headers | All responses | `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Strict-Transport-Security` (HSTS) |
 | Audit logging | Every authenticated write | Every submit/delete/trigger is logged to Cloud Logging *and* BigQuery (`audit_log` table) with identity, IP, and details |
+| Request Correlation | All responses | `X-Request-ID` header containing a UUID for tracking requests across logs |
 | Secrets in Secret Manager | Deployment | `deploy.sh` stores the Gemini key, Maps key, and admin key in Secret Manager, not as plain Cloud Build substitutions |
+
+---
+
+## 🛠️ Testing & Quality Assurance
+
+NARAD includes a full automated test suite to ensure the system is stable and safe for deployment.
+
+- **CI/CD Pipeline Gate**: The Cloud Build pipeline (`cloudbuild.yaml`) runs `pytest` automatically. The build will **fail** and refuse to deploy if any tests fail.
+- **Test Coverage**:
+  - `test_schemas.py`: Validates all Pydantic models and field constraints (e.g., negative bed counts).
+  - `test_security.py`: Ensures the fail-closed auth, rate limiters, and HSTS headers work properly.
+  - `test_manual_reports.py`: Tests the hospital report caching (memory and BigQuery logic).
+  - `test_rapids_engine.py`: Verifies the Monte Carlo simulations calculate risk bounds correctly.
+  - `test_live_feeds.py`: Checks the exponential backoff, retry logic, and timeouts.
+  - `test_parliament.py`: Ensures the ADK `Runner` cleans up sessions and respects execution timeouts to prevent memory leaks.
+  - `test_api_integration.py`: End-to-end checks on REST APIs.
+
+## 🛡️ Resilience & Incident Response
+
+To prevent system-wide stalls from external API failures, NARAD uses:
+- **Exponential Backoff**: Calls to Google Maps, OpenWeather, and OpenAQ automatically retry with backoff on failure before gracefully degrading to simulation mode.
+- **LLM Timeouts**: The Gemini ADK parliament loop runs with a strict 20-second timeout per session.
+- **Session Cleanup**: The ADK `Runner` aggressively cleans up old memory sessions to prevent Cloud Run out-of-memory errors.
+
+**For full runbooks on handling production failures, see [INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md).**
 
 **The access key model, honestly explained:** hospital staff/operators enter a shared admin key into the dashboard's "Access Key" field each browser session (stored in `sessionStorage` only — never written into the JS bundle, never in `localStorage`). `deploy.sh` generates this key randomly and prints it once during deployment.
 

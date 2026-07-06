@@ -32,6 +32,8 @@ _init_error: Optional[str] = None
 _PULSE_TABLE = "pulse_history"
 _DECISION_TABLE = "parliament_decisions"
 _AUDIT_TABLE = "audit_log"
+_HOSPITAL_REPORTS_TABLE = "hospital_reports"
+
 
 _PULSE_SCHEMA_SQL = """
     timestamp TIMESTAMP,
@@ -70,6 +72,18 @@ _AUDIT_SCHEMA_SQL = """
     details_json STRING
 """
 
+_HOSPITAL_REPORTS_SCHEMA_SQL = """
+    hospital_name STRING,
+    available_beds INT64,
+    icu_available INT64,
+    ambulances_active INT64,
+    emergency_wait_minutes FLOAT64,
+    reported_by STRING,
+    reported_at TIMESTAMP,
+    raw_json STRING
+"""
+
+
 
 def init_bigquery() -> None:
     """
@@ -97,6 +111,7 @@ def init_bigquery() -> None:
             (_PULSE_TABLE, _PULSE_SCHEMA_SQL),
             (_DECISION_TABLE, _DECISION_SCHEMA_SQL),
             (_AUDIT_TABLE, _AUDIT_SCHEMA_SQL),
+            (_HOSPITAL_REPORTS_TABLE, _HOSPITAL_REPORTS_SCHEMA_SQL),
         ]:
             table_id = f"{dataset_id}.{table_name}"
             _client.query(f"""
@@ -267,3 +282,59 @@ def insert_audit_log(action: str, identity: str, details: Dict[str, Any], client
             logger.error(f"BigQuery audit log insert errors: {errors}")
     except Exception as e:
         logger.error(f"BigQuery audit log insert failed: {e}")
+
+from backend.models.schemas import ManualHospitalReport
+
+def insert_hospital_report(report: ManualHospitalReport) -> None:
+    if not BIGQUERY_AVAILABLE or _client is None:
+        return
+    try:
+        table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{_HOSPITAL_REPORTS_TABLE}"
+        row = {
+            "hospital_name": report.hospital_name,
+            "available_beds": report.available_beds,
+            "icu_available": report.icu_available,
+            "ambulances_active": report.ambulances_active,
+            "emergency_wait_minutes": report.emergency_wait_minutes,
+            "reported_by": report.reported_by,
+            "reported_at": report.reported_at.isoformat(),
+            "raw_json": report.model_dump_json(),
+        }
+        errors = _client.insert_rows_json(table_id, [row])
+        if errors:
+            logger.error(f"BigQuery hospital report insert errors: {errors}")
+    except Exception as e:
+        logger.error(f"BigQuery hospital report insert failed: {e}")
+
+def query_hospital_reports() -> List[ManualHospitalReport]:
+    if not BIGQUERY_AVAILABLE or _client is None:
+        return []
+    try:
+        table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{_HOSPITAL_REPORTS_TABLE}"
+        # Fetch the latest report for each hospital
+        query = f"""
+            SELECT * FROM (
+                SELECT *, ROW_NUMBER() OVER(PARTITION BY hospital_name ORDER BY reported_at DESC) as rn
+                FROM `{table_id}`
+            ) WHERE rn = 1
+        """
+        rows = _client.query(query).result()
+        return [ManualHospitalReport.model_validate_json(row["raw_json"]) for row in rows if row.get("raw_json")]
+    except Exception as e:
+        logger.error(f"BigQuery hospital report query failed: {e}")
+        return []
+
+def delete_hospital_report(hospital_name: str) -> bool:
+    if not BIGQUERY_AVAILABLE or _client is None:
+        return False
+    try:
+        table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{_HOSPITAL_REPORTS_TABLE}"
+        query = f"""
+            DELETE FROM `{table_id}` WHERE hospital_name = "{hospital_name}"
+        """
+        _client.query(query).result()
+        return True
+    except Exception as e:
+        logger.error(f"BigQuery hospital report delete failed: {e}")
+        return False
+

@@ -10,6 +10,16 @@
 #   narad-gemini-key, narad-maps-key, narad-admin-key
 # ═══════════════════════════════════════════════════════════════════════
 steps:
+  # ── Run Test Suite (CI Gate) ──────────────────────────────────────────
+  - name: 'python:3.11-slim'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install -r backend/requirements.txt
+        cd backend
+        python -m pytest tests/ -v
+
   # ── Build the container image ─────────────────────────────────────────
   - name: 'gcr.io/cloud-builders/docker'
     args:

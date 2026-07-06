@@ -7,6 +7,7 @@ import asyncio
 import logging
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Dict, List, Set
@@ -130,8 +131,12 @@ async def trigger_parliament(trigger: str):
         await broadcast(WSMessage(type=WSEventType.ERROR, payload={"message": str(e)}))
 
 
+_refresh_task = None
+_parliament_task = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _refresh_task, _parliament_task
     logger.info(f"🚀 {APP_NAME} v{APP_VERSION} starting — GPU: {'✅ ACTIVE' if GPU_AVAILABLE else '⚠️ CPU fallback'}")
 
     # Attempt BigQuery connection — falls back to in-memory storage if unavailable
@@ -143,11 +148,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Initial data fetch failed: {e}")
 
-    refresh_task = asyncio.create_task(data_refresh_loop())
-    parliament_task = asyncio.create_task(parliament_loop())
+    _refresh_task = asyncio.create_task(data_refresh_loop())
+    _parliament_task = asyncio.create_task(parliament_loop())
     yield
-    refresh_task.cancel()
-    parliament_task.cancel()
+    if _refresh_task: _refresh_task.cancel()
+    if _parliament_task: _parliament_task.cancel()
     logger.info("👋 NARAD shutting down")
 
 
@@ -166,10 +171,13 @@ app.add_middleware(
 async def security_headers(request: Request, call_next):
     """Basic security headers on every response. Defense-in-depth, not a
     substitute for a real security review."""
+    request_id = str(uuid.uuid4())
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+    response.headers["X-Request-ID"] = request_id
     return response
 
 
@@ -211,7 +219,11 @@ async def health():
         "gpu": GPU_AVAILABLE,
         "sessions_run": state.session_count,
         "connected_clients": len(state.connected_clients),
-        "data_points": len(state.pulse_history)
+        "data_points": len(state.pulse_history),
+        "tasks": {
+            "data_refresh": not _refresh_task.done() if _refresh_task else False,
+            "parliament_loop": not _parliament_task.done() if _parliament_task else False
+        }
     }
 
 

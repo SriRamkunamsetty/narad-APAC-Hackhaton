@@ -23,6 +23,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List
 
 from backend.models.schemas import ManualHospitalReport
+from backend.data import bigquery_store
 
 logger = logging.getLogger("narad.manual_reports")
 
@@ -37,6 +38,8 @@ MANUAL_REPORT_FRESHNESS_MINUTES = 120
 def submit_hospital_report(report: ManualHospitalReport) -> ManualHospitalReport:
     """Store or overwrite a hospital's self-reported status"""
     _hospital_reports[report.hospital_name.strip()] = report
+    if bigquery_store.BIGQUERY_AVAILABLE:
+        bigquery_store.insert_hospital_report(report)
     logger.info(f"📋 Manual report received: {report.hospital_name} — "
                 f"{report.available_beds} beds, {report.icu_available} ICU")
     return report
@@ -45,15 +48,31 @@ def submit_hospital_report(report: ManualHospitalReport) -> ManualHospitalReport
 def get_fresh_hospital_reports(max_age_minutes: int = MANUAL_REPORT_FRESHNESS_MINUTES) -> List[ManualHospitalReport]:
     """Return only reports submitted within the freshness window"""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
+    
+    if bigquery_store.BIGQUERY_AVAILABLE:
+        bq_reports = bigquery_store.query_hospital_reports()
+        if bq_reports:
+            fresh = [r for r in bq_reports if r.reported_at >= cutoff]
+            return sorted(fresh, key=lambda r: r.reported_at, reverse=True)
+            
     fresh = [r for r in _hospital_reports.values() if r.reported_at >= cutoff]
     return sorted(fresh, key=lambda r: r.reported_at, reverse=True)
 
 
 def get_all_hospital_reports() -> List[ManualHospitalReport]:
     """Return every stored report, fresh or stale (for an admin/status view)"""
+    if bigquery_store.BIGQUERY_AVAILABLE:
+        bq_reports = bigquery_store.query_hospital_reports()
+        if bq_reports:
+            return sorted(bq_reports, key=lambda r: r.reported_at, reverse=True)
+            
     return sorted(_hospital_reports.values(), key=lambda r: r.reported_at, reverse=True)
 
 
 def delete_hospital_report(hospital_name: str) -> bool:
     """Remove a hospital's report (e.g. to correct a mistaken entry)"""
-    return _hospital_reports.pop(hospital_name.strip(), None) is not None
+    mem_removed = _hospital_reports.pop(hospital_name.strip(), None) is not None
+    if bigquery_store.BIGQUERY_AVAILABLE:
+        bq_removed = bigquery_store.delete_hospital_report(hospital_name.strip())
+        return mem_removed or bq_removed
+    return mem_removed

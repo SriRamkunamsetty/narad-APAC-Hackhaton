@@ -44,8 +44,6 @@ from typing import Deque, Dict, Optional
 
 from fastapi import Header, HTTPException, Request
 
-from backend.config import NARAD_ADMIN_API_KEY
-
 logger = logging.getLogger("narad.security")
 
 
@@ -57,6 +55,7 @@ async def verify_api_key(x_api_key: Optional[str] = Header(default=None)) -> str
     Fails CLOSED — if no key is configured server-side at all, writes are
     refused entirely rather than silently left open.
     """
+    from backend.config import NARAD_ADMIN_API_KEY
     if not NARAD_ADMIN_API_KEY:
         raise HTTPException(
             503,

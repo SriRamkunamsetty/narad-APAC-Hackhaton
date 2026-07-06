@@ -22,6 +22,20 @@ from backend.models.schemas import (
 
 logger = logging.getLogger("narad.feeds")
 
+async def _fetch_with_retry(client, url, max_retries=3, **kwargs):
+    """Execute an HTTP GET request with exponential backoff retries."""
+    for attempt in range(max_retries):
+        try:
+            r = await client.get(url, **kwargs)
+            r.raise_for_status()
+            return r
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            if attempt == max_retries - 1:
+                raise
+            delay = 1.0 * (2 ** attempt) + random.uniform(0, 0.5)
+            logger.warning(f"API fetch failed ({e}). Retrying in {delay:.1f}s...")
+            await asyncio.sleep(delay)
+
 
 def _time_factor() -> float:
     """Returns a 0-1 factor based on hour of day (peaks at morning/evening rush)"""
@@ -42,7 +56,8 @@ async def fetch_weather(city: str = DEFAULT_CITY) -> tuple[WeatherData, str]:
     if OPENWEATHER_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
-                r = await client.get(
+                r = await _fetch_with_retry(
+                    client,
                     "https://api.openweathermap.org/data/2.5/weather",
                     params={"q": f"{city},IN", "appid": OPENWEATHER_API_KEY, "units": "metric"}
                 )
@@ -89,7 +104,8 @@ async def fetch_aqi(city: str = DEFAULT_CITY) -> tuple[AQIData, str]:
     if OPENAQ_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
-                r = await client.get(
+                r = await _fetch_with_retry(
+                    client,
                     "https://api.openaq.org/v3/locations",
                     params={"city": city, "country": "IN", "limit": 5},
                     headers={"X-API-Key": OPENAQ_API_KEY}
