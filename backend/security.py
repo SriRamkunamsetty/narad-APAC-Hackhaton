@@ -44,6 +44,8 @@ from typing import Deque, Dict, Optional
 
 from fastapi import Header, HTTPException, Request
 
+from backend import config
+
 logger = logging.getLogger("narad.security")
 
 
@@ -55,15 +57,14 @@ async def verify_api_key(x_api_key: Optional[str] = Header(default=None)) -> str
     Fails CLOSED — if no key is configured server-side at all, writes are
     refused entirely rather than silently left open.
     """
-    from backend.config import NARAD_ADMIN_API_KEY
-    if not NARAD_ADMIN_API_KEY:
+    if not config.NARAD_ADMIN_API_KEY:
         raise HTTPException(
             503,
             "Write operations are disabled: NARAD_ADMIN_API_KEY is not configured "
             "on the server. Set it in the environment before allowing any "
             "data-mutating requests."
         )
-    if not x_api_key or x_api_key != NARAD_ADMIN_API_KEY:
+    if not x_api_key or x_api_key != config.NARAD_ADMIN_API_KEY:
         raise HTTPException(401, "Invalid or missing X-API-Key header")
     return x_api_key
 

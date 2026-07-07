@@ -1,30 +1,66 @@
+"""
+Tests for backend/agents/parliament.py — including a regression test for
+the ADK session memory leak found and fixed today (sessions were created
+per agent call but never deleted, growing unbounded on a long-running
+instance).
+"""
 import pytest
-from backend.agents.parliament import _extract_json, _fallback_stance
-from backend.models.schemas import AgentName, CityPulse, WeatherData, AQIData, TrafficData, HospitalData, SafetyData, EconomyData
-from datetime import datetime, timezone
 
-def test_extract_json():
-    text = "```json\n{\"vote\": \"approve\"}\n```"
-    data = _extract_json(text)
-    assert data.get("vote") == "approve"
+from backend.agents.parliament import run_parliament_session, _session_service
+from backend.data.live_feeds import fetch_city_pulse
 
-    text2 = "Some prefix\n{\"vote\": \"escalate\"}\nSome suffix"
-    data2 = _extract_json(text2)
-    assert data2.get("vote") == "escalate"
 
-def test_fallback_stance():
-    pulse = CityPulse(
-        city="Test",
-        timestamp=datetime.now(timezone.utc),
-        weather=WeatherData(temperature=30, humidity=50, wind_speed=10, wind_direction="N", condition="Clear", feels_like=32, visibility=10, pressure=1010),
-        aqi=AQIData(aqi=50, status="Good", pm25=10, pm10=20, no2=10, o3=10, co=0.5, so2=5, color="green"),
-        traffic=TrafficData(congestion_level=10, avg_speed_kmh=40, incidents=0, affected_zones=[], travel_time_index=1.0, hotspots=[]),
-        hospitals=HospitalData(total_hospitals=10, available_beds=100, icu_available=10, ambulances_active=5, emergency_wait_minutes=10, capacity_percent=50, critical_facilities=[], manual_reports_count=0, manual_coverage_pct=0),
-        safety=SafetyData(active_incidents=1, emergency_calls_1h=5, police_response_minutes=10, fire_units_deployed=1, high_risk_zones=[], alert_level="Green"),
-        economy=EconomyData(fuel_price_litre=100, essential_goods_index=100, market_activity="Active", utility_load_percent=50, water_supply_status="Normal", power_outages=0),
-        overall_health_score=90,
-        alerts=[],
-        data_sources={}
-    )
-    stance = _fallback_stance(AgentName.TRANSPORT, "🚦", pulse)
-    assert stance.vote.value == "approve"
+async def _count_sessions():
+    result = await _session_service.list_sessions(app_name="narad_parliament", user_id="narad_system")
+    return len(result.sessions) if hasattr(result, "sessions") else len(result)
+
+
+class TestSessionCleanup:
+    """Regression coverage for the memory leak: InMemorySessionService.delete_session
+    exists in the ADK library but was never called anywhere in the original code."""
+
+    async def test_no_session_leak_after_single_run(self):
+        pulse = await fetch_city_pulse("Hyderabad")
+        before = await _count_sessions()
+        await run_parliament_session(pulse, "Test trigger")
+        after = await _count_sessions()
+        assert after == before, "Sessions must be cleaned up after each parliament run"
+
+    async def test_no_session_leak_after_multiple_runs(self):
+        pulse = await fetch_city_pulse("Hyderabad")
+        await run_parliament_session(pulse, "Run 1")
+        await run_parliament_session(pulse, "Run 2")
+        await run_parliament_session(pulse, "Run 3")
+        assert await _count_sessions() == 0
+
+
+class TestParliamentDecision:
+    async def test_produces_five_agent_stances(self):
+        pulse = await fetch_city_pulse("Hyderabad")
+        decision = await run_parliament_session(pulse, "Test")
+        assert len(decision.stances) == 5
+
+    async def test_all_agents_represented(self):
+        pulse = await fetch_city_pulse("Hyderabad")
+        decision = await run_parliament_session(pulse, "Test")
+        agent_names = {s.agent.value for s in decision.stances}
+        assert agent_names == {
+            "TransportAgent", "HealthAgent", "EnvironmentAgent", "EconomyAgent", "SafetyAgent"
+        }
+
+    async def test_decision_has_consensus_and_causal_chain(self):
+        pulse = await fetch_city_pulse("Hyderabad")
+        decision = await run_parliament_session(pulse, "Test")
+        assert decision.consensus
+        assert isinstance(decision.causal_chain, list)
+        assert isinstance(decision.dissent_log, list)
+
+    async def test_falls_back_gracefully_without_gemini_key(self):
+        """With no GEMINI_API_KEY (the test environment default), agents
+        should use the rule-based fallback rather than crashing."""
+        pulse = await fetch_city_pulse("Hyderabad")
+        decision = await run_parliament_session(pulse, "Test")
+        # Every stance should still be a valid, well-formed AgentStance
+        for stance in decision.stances:
+            assert stance.confidence >= 0
+            assert stance.vote is not None

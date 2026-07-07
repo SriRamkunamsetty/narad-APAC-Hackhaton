@@ -34,6 +34,15 @@ _DECISION_TABLE = "parliament_decisions"
 _AUDIT_TABLE = "audit_log"
 _HOSPITAL_REPORTS_TABLE = "hospital_reports"
 
+_HOSPITAL_REPORTS_SCHEMA_SQL = """
+    hospital_name STRING,
+    available_beds INT64,
+    icu_available INT64,
+    ambulances_active INT64,
+    emergency_wait_minutes FLOAT64,
+    reported_by STRING,
+    reported_at TIMESTAMP
+"""
 
 _PULSE_SCHEMA_SQL = """
     timestamp TIMESTAMP,
@@ -71,18 +80,6 @@ _AUDIT_SCHEMA_SQL = """
     client_ip STRING,
     details_json STRING
 """
-
-_HOSPITAL_REPORTS_SCHEMA_SQL = """
-    hospital_name STRING,
-    available_beds INT64,
-    icu_available INT64,
-    ambulances_active INT64,
-    emergency_wait_minutes FLOAT64,
-    reported_by STRING,
-    reported_at TIMESTAMP,
-    raw_json STRING
-"""
-
 
 
 def init_bigquery() -> None:
@@ -259,6 +256,66 @@ def query_similar_past_decisions(overall_urgency: str, city: str, limit: int = 3
         return []
 
 
+def insert_hospital_report(hospital_name: str, available_beds: int, icu_available: int,
+                            ambulances_active: int, emergency_wait_minutes: float,
+                            reported_by: Optional[str], reported_at: datetime) -> None:
+    """
+    Persist a hospital self-report to BigQuery, so it's visible to EVERY
+    Cloud Run instance, not just the one that received the write. Without
+    this, hospital reports are only visible on the single instance that
+    handled the submission — a real correctness gap under horizontal scaling
+    (Cloud Run's whole reason for existing). No-op if BigQuery is unavailable;
+    the in-memory store (manual_reports.py) still works standalone for a
+    single-instance deployment.
+    """
+    if not BIGQUERY_AVAILABLE or _client is None:
+        return
+    try:
+        table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{_HOSPITAL_REPORTS_TABLE}"
+        row = {
+            "hospital_name": hospital_name,
+            "available_beds": available_beds,
+            "icu_available": icu_available,
+            "ambulances_active": ambulances_active,
+            "emergency_wait_minutes": emergency_wait_minutes,
+            "reported_by": reported_by or "",
+            "reported_at": reported_at.isoformat(),
+        }
+        errors = _client.insert_rows_json(table_id, [row])
+        if errors:
+            logger.error(f"BigQuery hospital report insert errors: {errors}")
+    except Exception as e:
+        logger.error(f"BigQuery hospital report insert failed: {e}")
+
+
+def query_fresh_hospital_reports(max_age_minutes: int = 120) -> List[Dict[str, Any]]:
+    """
+    Query the LATEST report per hospital (across ALL instances) within the
+    freshness window. This is what makes hospital self-reporting correct
+    when Cloud Run scales beyond a single instance.
+    """
+    if not BIGQUERY_AVAILABLE or _client is None:
+        return []
+    try:
+        table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{_HOSPITAL_REPORTS_TABLE}"
+        query = f"""
+            SELECT * EXCEPT(rn) FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY hospital_name ORDER BY reported_at DESC
+                ) AS rn
+                FROM `{table_id}`
+                WHERE reported_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(max_age_minutes)} MINUTE)
+            )
+            WHERE rn = 1
+            ORDER BY reported_at DESC
+        """
+        rows = _client.query(query).result()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"BigQuery hospital reports query failed: {e}")
+        return []
+
+
 def insert_audit_log(action: str, identity: str, details: Dict[str, Any], client_ip: str = "unknown") -> None:
     """
     Persist a security audit event (data submission, deletion, manual
@@ -282,59 +339,3 @@ def insert_audit_log(action: str, identity: str, details: Dict[str, Any], client
             logger.error(f"BigQuery audit log insert errors: {errors}")
     except Exception as e:
         logger.error(f"BigQuery audit log insert failed: {e}")
-
-from backend.models.schemas import ManualHospitalReport
-
-def insert_hospital_report(report: ManualHospitalReport) -> None:
-    if not BIGQUERY_AVAILABLE or _client is None:
-        return
-    try:
-        table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{_HOSPITAL_REPORTS_TABLE}"
-        row = {
-            "hospital_name": report.hospital_name,
-            "available_beds": report.available_beds,
-            "icu_available": report.icu_available,
-            "ambulances_active": report.ambulances_active,
-            "emergency_wait_minutes": report.emergency_wait_minutes,
-            "reported_by": report.reported_by,
-            "reported_at": report.reported_at.isoformat(),
-            "raw_json": report.model_dump_json(),
-        }
-        errors = _client.insert_rows_json(table_id, [row])
-        if errors:
-            logger.error(f"BigQuery hospital report insert errors: {errors}")
-    except Exception as e:
-        logger.error(f"BigQuery hospital report insert failed: {e}")
-
-def query_hospital_reports() -> List[ManualHospitalReport]:
-    if not BIGQUERY_AVAILABLE or _client is None:
-        return []
-    try:
-        table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{_HOSPITAL_REPORTS_TABLE}"
-        # Fetch the latest report for each hospital
-        query = f"""
-            SELECT * FROM (
-                SELECT *, ROW_NUMBER() OVER(PARTITION BY hospital_name ORDER BY reported_at DESC) as rn
-                FROM `{table_id}`
-            ) WHERE rn = 1
-        """
-        rows = _client.query(query).result()
-        return [ManualHospitalReport.model_validate_json(row["raw_json"]) for row in rows if row.get("raw_json")]
-    except Exception as e:
-        logger.error(f"BigQuery hospital report query failed: {e}")
-        return []
-
-def delete_hospital_report(hospital_name: str) -> bool:
-    if not BIGQUERY_AVAILABLE or _client is None:
-        return False
-    try:
-        table_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}.{_HOSPITAL_REPORTS_TABLE}"
-        query = f"""
-            DELETE FROM `{table_id}` WHERE hospital_name = "{hospital_name}"
-        """
-        _client.query(query).result()
-        return True
-    except Exception as e:
-        logger.error(f"BigQuery hospital report delete failed: {e}")
-        return False
-

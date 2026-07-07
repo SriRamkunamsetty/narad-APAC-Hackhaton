@@ -22,19 +22,26 @@ from backend.models.schemas import (
 
 logger = logging.getLogger("narad.feeds")
 
-async def _fetch_with_retry(client, url, max_retries=3, **kwargs):
-    """Execute an HTTP GET request with exponential backoff retries."""
-    for attempt in range(max_retries):
+
+async def _fetch_with_retry(client: httpx.AsyncClient, url: str, params: dict = None,
+                             headers: dict = None, max_attempts: int = 2) -> Optional[httpx.Response]:
+    """
+    Single retry with short backoff for transient network failures. Not
+    infinite retries — a real outage should fall through to simulation
+    quickly, not hang the request pipeline. Returns None (never raises) if
+    all attempts fail, so callers keep their existing try/except-based
+    simulation fallback unchanged.
+    """
+    last_error = None
+    for attempt in range(max_attempts):
         try:
-            r = await client.get(url, **kwargs)
-            r.raise_for_status()
-            return r
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            if attempt == max_retries - 1:
-                raise
-            delay = 1.0 * (2 ** attempt) + random.uniform(0, 0.5)
-            logger.warning(f"API fetch failed ({e}). Retrying in {delay:.1f}s...")
-            await asyncio.sleep(delay)
+            return await client.get(url, params=params, headers=headers)
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))  # 0.5s, then 1s
+    logger.warning(f"All {max_attempts} attempts failed for {url}: {last_error}")
+    return None
 
 
 def _time_factor() -> float:
@@ -57,11 +64,10 @@ async def fetch_weather(city: str = DEFAULT_CITY) -> tuple[WeatherData, str]:
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 r = await _fetch_with_retry(
-                    client,
-                    "https://api.openweathermap.org/data/2.5/weather",
+                    client, "https://api.openweathermap.org/data/2.5/weather",
                     params={"q": f"{city},IN", "appid": OPENWEATHER_API_KEY, "units": "metric"}
                 )
-                if r.status_code == 200:
+                if r and r.status_code == 200:
                     d = r.json()
                     return WeatherData(
                         temperature=d["main"]["temp"],
@@ -105,12 +111,11 @@ async def fetch_aqi(city: str = DEFAULT_CITY) -> tuple[AQIData, str]:
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 r = await _fetch_with_retry(
-                    client,
-                    "https://api.openaq.org/v3/locations",
+                    client, "https://api.openaq.org/v3/locations",
                     params={"city": city, "country": "IN", "limit": 5},
                     headers={"X-API-Key": OPENAQ_API_KEY}
                 )
-                if r.status_code == 200:
+                if r and r.status_code == 200:
                     data = r.json()
                     if data.get("results"):
                         # Use first available location's latest readings

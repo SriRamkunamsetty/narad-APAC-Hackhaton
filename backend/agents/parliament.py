@@ -39,6 +39,11 @@ _AGENTS = {
 }
 
 _session_service = InMemorySessionService()
+
+# Hard ceiling on a single agent's Gemini call. Without this, a hung API
+# call blocks the entire parliament session indefinitely (asyncio.gather
+# waits for every task, including a stuck one).
+AGENT_TIMEOUT_SECONDS = 20
 _agent_instances: Dict[str, Any] = {}
 _runners: Dict[str, Runner] = {}
 
@@ -137,12 +142,12 @@ async def _run_single_agent(agent_name: AgentName, pulse: CityPulse, trigger: st
     emoji = _AGENTS[agent_name]["emoji"]
     t0 = time.time()
 
+    user_id = "narad_system"
+    session_id = f"session_{agent_name.value}_{uuid.uuid4().hex[:8]}"
+
     try:
         runner = _get_runner(agent_name.value)
         prompt = _build_agent_prompt(agent_name, pulse, trigger)
-
-        user_id = "narad_system"
-        session_id = f"session_{agent_name.value}_{uuid.uuid4().hex[:8]}"
 
         await _session_service.create_session(
             app_name="narad_parliament", user_id=user_id, session_id=session_id
@@ -151,26 +156,21 @@ async def _run_single_agent(agent_name: AgentName, pulse: CityPulse, trigger: st
         content = genai_types.Content(role="user", parts=[genai_types.Part(text=prompt)])
 
         final_text = ""
-        try:
-            # Add timeout protection to prevent indefinite hangs
-            run_coro = runner.run_async(
+
+        async def _consume_stream():
+            nonlocal final_text
+            async for event in runner.run_async(
                 user_id=user_id, session_id=session_id, new_message=content
-            )
-            # wait_for works on async generators in 3.11+, but actually run_async returns an async generator.
-            # To apply timeout to the whole generation:
-            async def _consume():
-                text = ""
-                async for event in run_coro:
-                    if hasattr(event, "content") and event.content and event.content.parts:
-                        for part in event.content.parts:
-                            if hasattr(part, "text") and part.text:
-                                text += part.text
-                return text
-            
-            final_text = await asyncio.wait_for(_consume(), timeout=20.0)
-        finally:
-            # Fix ADK session memory leak
-            await _session_service.delete_session(session_id)
+            ):
+                if hasattr(event, "content") and event.content and event.content.parts:
+                    for part in event.content.parts:
+                        if hasattr(part, "text") and part.text:
+                            final_text += part.text
+
+        # Hard timeout — without this, a hung Gemini call hangs the whole
+        # parliament session (all 5 agents run concurrently, but a single
+        # stuck agent still blocks asyncio.gather from ever returning).
+        await asyncio.wait_for(_consume_stream(), timeout=AGENT_TIMEOUT_SECONDS)
 
         parsed = _extract_json(final_text)
 
@@ -189,10 +189,29 @@ async def _run_single_agent(agent_name: AgentName, pulse: CityPulse, trigger: st
                      f"({(time.time()-t0)*1000:.0f}ms)")
         return stance
 
+    except asyncio.TimeoutError:
+        logger.error(f"⏱️  Agent {agent_name.value} timed out after {AGENT_TIMEOUT_SECONDS}s — "
+                     f"falling back to rule-based decision")
+        return _fallback_stance(agent_name, emoji, pulse)
+
     except Exception as e:
         logger.exception(f"❌ Agent {agent_name.value} failed — falling back to rule-based decision. "
                           f"Root cause: {type(e).__name__}: {e}")
         return _fallback_stance(agent_name, emoji, pulse)
+
+    finally:
+        # ALWAYS clean up the session, whether the call succeeded, failed, or
+        # timed out. Without this, every session leaks — confirmed via
+        # InMemorySessionService.delete_session existing but never being
+        # called anywhere in the original code. At one parliament session per
+        # minute running indefinitely, this previously grew memory until the
+        # instance restarted.
+        try:
+            await _session_service.delete_session(
+                app_name="narad_parliament", user_id=user_id, session_id=session_id
+            )
+        except Exception as cleanup_error:
+            logger.warning(f"Session cleanup failed for {session_id} (non-fatal): {cleanup_error}")
 
 
 def _extract_json(text: str) -> Dict[str, Any]:

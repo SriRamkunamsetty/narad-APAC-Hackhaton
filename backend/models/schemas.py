@@ -213,7 +213,7 @@ class WSEventType(str, Enum):
 class WSMessage(BaseModel):
     type: WSEventType
     payload: Any
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ─── Benchmark ────────────────────────────────────────────────────────────────

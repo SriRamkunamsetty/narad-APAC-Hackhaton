@@ -92,6 +92,9 @@ narad/
 │   │   └── bigquery_store.py      # Persistent history: pulse snapshots + parliament decisions
 │   ├── models/
 │   │   └── schemas.py             # Pydantic schemas for all data structures
+│   ├── tests/                     # 68 automated tests — schemas, security, RAPIDS,
+│   │                               # live feeds, parliament (incl. session leak regression),
+│   │                               # and full HTTP-layer integration tests
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/
@@ -110,6 +113,8 @@ narad/
 ├── Dockerfile                      # CPU deployment (works everywhere, no GPU needed)
 ├── Dockerfile.gpu                  # GPU deployment with real RAPIDS/cuDF acceleration
 ├── setup.sh                        # Local dev setup
+├── docs/
+│   └── INCIDENT_RESPONSE.md         # Runbook for common production failure scenarios
 └── .env.example
 ```
 
@@ -241,6 +246,19 @@ gcloud run deploy narad-gpu \
 
 ---
 
+## 🧪 Testing
+
+```bash
+pip install -r backend/requirements.txt --break-system-packages
+python3 -m pytest backend/tests/ -v
+```
+
+68 tests covering: input validation (rejecting negative bed counts, oversized strings, excessive scenario counts), security (API key auth fails closed, rate limiting actually blocks over-limit requests), the ADK session leak regression (session count must return to zero after every parliament run), simulation fallback correctness, and full HTTP-layer integration tests via `TestClient` — not just internal function calls.
+
+This suite runs automatically as a required gate in `deployment/cloudbuild.yaml` — **a failing test suite stops the deployment**, it doesn't just log a warning.
+
+---
+
 ## 🔒 Security
 
 Every write endpoint fails **closed**, not open — if `NARAD_ADMIN_API_KEY` isn't configured on the server, data-mutating requests are refused outright rather than silently allowed through.
@@ -255,34 +273,10 @@ Every write endpoint fails **closed**, not open — if `NARAD_ADMIN_API_KEY` isn
 | Input validation (Pydantic `Field` constraints) | All write payloads | Negative bed counts, oversized strings, malformed numeric input |
 | Restricted CORS | All endpoints | Arbitrary third-party websites making cross-origin requests against the API |
 | Security headers | All responses | `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Strict-Transport-Security` (HSTS) |
+| Request correlation IDs | All responses (`X-Request-ID`) | Makes one request traceable through 5 concurrent agent calls in production logs |
 | Audit logging | Every authenticated write | Every submit/delete/trigger is logged to Cloud Logging *and* BigQuery (`audit_log` table) with identity, IP, and details |
-| Request Correlation | All responses | `X-Request-ID` header containing a UUID for tracking requests across logs |
 | Secrets in Secret Manager | Deployment | `deploy.sh` stores the Gemini key, Maps key, and admin key in Secret Manager, not as plain Cloud Build substitutions |
-
----
-
-## 🛠️ Testing & Quality Assurance
-
-NARAD includes a full automated test suite to ensure the system is stable and safe for deployment.
-
-- **CI/CD Pipeline Gate**: The Cloud Build pipeline (`cloudbuild.yaml`) runs `pytest` automatically. The build will **fail** and refuse to deploy if any tests fail.
-- **Test Coverage**:
-  - `test_schemas.py`: Validates all Pydantic models and field constraints (e.g., negative bed counts).
-  - `test_security.py`: Ensures the fail-closed auth, rate limiters, and HSTS headers work properly.
-  - `test_manual_reports.py`: Tests the hospital report caching (memory and BigQuery logic).
-  - `test_rapids_engine.py`: Verifies the Monte Carlo simulations calculate risk bounds correctly.
-  - `test_live_feeds.py`: Checks the exponential backoff, retry logic, and timeouts.
-  - `test_parliament.py`: Ensures the ADK `Runner` cleans up sessions and respects execution timeouts to prevent memory leaks.
-  - `test_api_integration.py`: End-to-end checks on REST APIs.
-
-## 🛡️ Resilience & Incident Response
-
-To prevent system-wide stalls from external API failures, NARAD uses:
-- **Exponential Backoff**: Calls to Google Maps, OpenWeather, and OpenAQ automatically retry with backoff on failure before gracefully degrading to simulation mode.
-- **LLM Timeouts**: The Gemini ADK parliament loop runs with a strict 20-second timeout per session.
-- **Session Cleanup**: The ADK `Runner` aggressively cleans up old memory sessions to prevent Cloud Run out-of-memory errors.
-
-**For full runbooks on handling production failures, see [INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md).**
+| Test suite as a deploy gate | Cloud Build | 68 tests must pass before any deployment proceeds — a red suite stops the build |
 
 **The access key model, honestly explained:** hospital staff/operators enter a shared admin key into the dashboard's "Access Key" field each browser session (stored in `sessionStorage` only — never written into the JS bundle, never in `localStorage`). `deploy.sh` generates this key randomly and prints it once during deployment.
 
@@ -316,7 +310,8 @@ To prevent system-wide stalls from external API failures, NARAD uses:
 | LLM | Gemini 2.0 Flash |
 | Natural language interface | "Ask NARAD" — Gemini + lightweight RAG (live pulse + BigQuery history), English/Hindi/Telugu |
 | Acceleration | NVIDIA RAPIDS (cuDF, CuPy) with automatic CPU (pandas/NumPy) fallback |
-| Persistent storage | BigQuery — pulse history + parliament decisions (PS2 data-layer requirement) |
+| Persistent storage | BigQuery — pulse history, parliament decisions, hospital reports (cross-instance sync), audit log |
+| Testing | pytest, 68 tests, run as a required Cloud Build gate before every deploy |
 | Backend | FastAPI, WebSockets, asyncio |
 | Frontend | React 18, TypeScript, Vite, Tailwind CSS, Recharts |
 | Deployment | Docker, Google Cloud Run, Cloud Build, Artifact Registry |
@@ -332,14 +327,14 @@ Being upfront about this — it's what a serious engineer would want to know:
 - **Weather & Air Quality**: Real OpenWeatherMap/OpenAQ APIs when keys are provided; falls back to a physically-realistic simulation model (seasonal AQI patterns for Hyderabad) when keys are absent.
 - **Traffic**: Real Google Maps Distance Matrix API (`departure_time=now`, live `duration_in_traffic`) across four major Hyderabad corridors (Gachibowli–Hitech City, Kukatpally–Secunderabad, Banjara Hills–Madhapur, LB Nagar–Abids) when `GOOGLE_MAPS_API_KEY` is set. Falls back to time-of-day-curve simulation otherwise.
 - **RAPIDS acceleration**: On a machine with an NVIDIA GPU + cuDF installed, this runs *actual* GPU-accelerated Monte Carlo simulation and benchmarking. Without a GPU, it computes the real CPU (pandas/NumPy) baseline and reports a clearly-labeled *simulated* speedup (based on published RAPIDS benchmark ratios) — the code path (`GPU_AVAILABLE` flag) is identical, so deploying to a GPU-backed Cloud Run instance flips it to fully real with zero code changes.
-- **Hospital capacity**: Three-tier data — (1) a live public HMIS API, if one ever becomes available, would slot in with zero changes elsewhere; (2) **hospital staff self-report their own status directly** through the dashboard's "Hospital Status Reporting" form — this is genuinely real data the moment it's submitted, no external vendor needed; (3) any hospitals that haven't self-reported yet are filled in with realistic simulation so the city-wide total stays meaningful. The dashboard shows exactly how many hospitals are self-reporting and what % coverage that represents.
+- **Hospital capacity**: Three-tier data — (1) a live public HMIS API, if one ever becomes available, would slot in with zero changes elsewhere; (2) **hospital staff self-report their own status directly** through the dashboard's "Hospital Status Reporting" form — this is genuinely real data the moment it's submitted, no external vendor needed; (3) any hospitals that haven't self-reported yet are filled in with realistic simulation so the city-wide total stays meaningful. The dashboard shows exactly how many hospitals are self-reporting and what % coverage that represents. Reports write through to BigQuery and merge back in on every read, so a report submitted to one Cloud Run instance is correctly visible from every other instance — not just the one that received it.
 - **Safety data**: Still simulated for now — same reasoning as hospitals (no public police/incident API exists), and the identical self-reporting pattern could be added for police stations with no architecture changes, just a parallel endpoint.
 - **Economy data** (utility load, fuel price): Simulated — the only "real" options are unofficial scraper APIs with no reliability guarantee, which isn't a foundation worth building a civic tool on.
 
 ### Self-check your setup
-NARAD shows exactly what's real directly in the dashboard — every metric card in the top row carries a small **● Live** or **○ Sim** badge, sourced from the backend's own `data_sources` field on each city pulse update. There's no need to trust a README claim; the running app tells you.
+NARAD shows exactly what's real directly in the dashboard — every metric card in the top row carries a small **● Live**, **✎ Manual**, or **○ Sim** badge, sourced from the backend's own `data_sources` field on each city pulse update. There's no need to trust a README claim; the running app tells you.
 
-For a deeper check (e.g. before a demo), two diagnostic endpoints confirm each integration explicitly:
+For a deeper check (e.g. before a demo), three diagnostic endpoints confirm each integration explicitly:
 
 ```bash
 curl http://localhost:8080/api/diagnostics/llm
@@ -347,8 +342,11 @@ curl http://localhost:8080/api/diagnostics/llm
 
 curl http://localhost:8080/api/diagnostics/traffic
 # → { "mode": "live_google_maps" | "simulation", "error": "..." }
+
+curl http://localhost:8080/api/diagnostics/bigquery
+# → { "available": true/false, "error": "..." }
 ```
-If either shows `false`/`"simulation"` with a non-null `error`, the message tells you exactly what to fix (usually: add the API key to `.env` and restart).
+If any shows `false`/`"simulation"` with a non-null `error`, the message tells you exactly what to fix (usually: add the API key/credentials to `.env` and restart).
 
 ---
 
@@ -357,22 +355,28 @@ If either shows `false`/`"simulation"` with a non-null `error`, the message tell
 This section exists because NARAD was built with the intent of handing it to a real government body for real operational use. That's a fundamentally different bar than a hackathon demo, and it deserves a direct, specific answer rather than a vague "it's secure" claim.
 
 **What this project genuinely has going for it, as of this build:**
-- Fail-closed authentication on every write path (REST and WebSocket), tested end-to-end
-- Input validation, rate limiting, restricted CORS, security headers, audit logging to BigQuery
+- Fail-closed authentication on every write path (REST and WebSocket), tested end-to-end — including a real WebSocket auth bypass found and fixed during testing
+- Input validation, rate limiting, restricted CORS, security headers (including HSTS), audit logging to BigQuery
 - Honest data provenance (Live/Manual/Simulated badges) so no one is misled about what's real
 - Secrets stored in Secret Manager, not in code or plain build substitutions
+- **68 automated tests**, run as a required gate before every deployment (Cloud Build fails the build on a red test suite — see `deployment/cloudbuild.yaml`)
+- A fixed memory leak (ADK sessions were never cleaned up — confirmed via a before/after session-count regression test), timeout protection on every Gemini call, and retry-with-backoff on external HTTP calls
+- Hospital reports now sync across multiple Cloud Run instances via BigQuery write-through (previously in-memory only, which silently broke under horizontal scaling)
+- A deepened `/api/health` endpoint that actually checks dependency state (Gemini configured, BigQuery reachable, background loops alive) instead of returning a static ping
+- Request correlation IDs (`X-Request-ID`) for tracing one request through concurrent agent calls in production logs
+- A starting incident response runbook (`docs/INCIDENT_RESPONSE.md`) covering common failure scenarios
 
 **What is genuinely still missing before this should run any real hospital, emergency, or government workflow:**
 
-1. **A formal security audit (VAPT).** In India, government-facing IT systems generally require a Vulnerability Assessment and Penetration Testing engagement with a **CERT-In empanelled auditor** before go-live. This is a compliance requirement, not optional due diligence — nothing in this codebase substitutes for it.
+1. **A formal security audit (VAPT).** In India, government-facing IT systems generally require a Vulnerability Assessment and Penetration Testing engagement with a **CERT-In empanelled auditor** before go-live. This is a compliance requirement, not optional due diligence — 68 passing tests are a meaningfully different thing than an independent audit, and don't substitute for one.
 2. **Real per-user authentication.** The current shared-admin-key model (see [Security](#-security) above) cannot attribute a write action to a specific verified human. Firebase Authentication / Cloud Identity Platform, with per-user accounts for every hospital and department, is required before real accountability is possible.
 3. **A data protection / privacy review.** Hospital capacity data, even aggregated, may fall under data protection obligations depending on what's eventually connected (patient-level data is NOT currently handled, deliberately — but any future integration would need this reviewed by qualified counsel, not inferred from this README).
-4. **Infrastructure hardening beyond a single Cloud Run service.** Production government infrastructure typically needs: multi-region failover, formal SLAs, a incident response runbook, monitoring/alerting (Cloud Monitoring + on-call), and a tested disaster recovery plan. None of that exists yet — this is one Cloud Run service with in-memory buffers as a fallback layer.
-5. **Load testing at real scale.** This has been tested for correctness, not for concurrent load from thousands of real users or a genuine city-wide emergency spike in traffic.
+4. **Multi-region failover, formal SLAs, and Cloud Monitoring alerting.** The incident response runbook exists, but nothing pages anyone yet — there's no alerting policy wired to `/api/health` reporting unhealthy. This is the natural next step, explicitly flagged as not done in the runbook itself rather than silently assumed.
+5. **Load testing at real scale.** 68 tests verify correctness; none of them verify behavior under concurrent load from thousands of real users or a genuine city-wide emergency traffic spike.
 6. **Legal/procurement sign-off.** Any real government deployment goes through a formal procurement, data-sharing agreement, and legal review process — a hackathon project can be the *technical basis* for a pilot proposal, but it isn't a substitute for that process.
 7. **A real human-in-the-loop decision policy.** NARAD is decision *support* — every action_plan item and consensus statement should require explicit human sign-off before anything operational happens (dispatching resources, issuing public advisories). Nothing in this codebase should be wired to autonomously execute real-world actions without that gate, and it currently isn't — keep it that way.
 
-**How I'd frame this to a government stakeholder, honestly:** *"This is a working technical prototype that demonstrates a genuinely novel decision-support architecture, with real security fundamentals in place. It is not yet a certified, audited production system, and shouldn't be represented as one. The right next step is a security audit and a pilot program with human oversight at every stage — not a direct production handoff."* That framing will land far better with any serious government IT evaluator than an overclaim would, and it's also just the accurate state of things.
+**How I'd frame this to a government stakeholder, honestly:** *"This is a working technical prototype with a genuinely novel decision-support architecture, an automated test suite, and real security fundamentals — including bugs we found and fixed through testing, not just claimed away. It is not yet a certified, audited production system, and shouldn't be represented as one. The right next step is a security audit and a pilot program with human oversight at every stage — not a direct production handoff."* That framing will land far better with any serious government IT evaluator than an overclaim would, and it's also just the accurate state of things.
 
 ---
 

@@ -131,12 +131,13 @@ async def trigger_parliament(trigger: str):
         await broadcast(WSMessage(type=WSEventType.ERROR, payload={"message": str(e)}))
 
 
-_refresh_task = None
+_data_refresh_task = None
 _parliament_task = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _refresh_task, _parliament_task
+    global _data_refresh_task, _parliament_task
     logger.info(f"🚀 {APP_NAME} v{APP_VERSION} starting — GPU: {'✅ ACTIVE' if GPU_AVAILABLE else '⚠️ CPU fallback'}")
 
     # Attempt BigQuery connection — falls back to in-memory storage if unavailable
@@ -148,11 +149,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Initial data fetch failed: {e}")
 
-    _refresh_task = asyncio.create_task(data_refresh_loop())
+    _data_refresh_task = asyncio.create_task(data_refresh_loop())
     _parliament_task = asyncio.create_task(parliament_loop())
     yield
-    if _refresh_task: _refresh_task.cancel()
-    if _parliament_task: _parliament_task.cancel()
+    _data_refresh_task.cancel()
+    _parliament_task.cancel()
     logger.info("👋 NARAD shutting down")
 
 
@@ -171,12 +172,27 @@ app.add_middleware(
 async def security_headers(request: Request, call_next):
     """Basic security headers on every response. Defense-in-depth, not a
     substitute for a real security review."""
-    request_id = str(uuid.uuid4())
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+    # Cloud Run terminates TLS in front of the app, so this is safe to send
+    # unconditionally — the browser only sees requests over HTTPS anyway.
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """
+    Attaches a short correlation ID to every request and to the logger
+    context, so one request's flow through 5 concurrent agent calls (or any
+    other multi-step operation) can be traced in Cloud Logging instead of
+    being an unlabeled interleaved mess.
+    """
+    request_id = uuid.uuid4().hex[:12]
+    request.state.request_id = request_id
+    response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
     return response
 
@@ -214,16 +230,40 @@ async def root():
 
 @app.get("/api/health")
 async def health():
+    """
+    Deeper than a static ping — reports whether core dependencies are
+    actually configured/reachable, and whether the background loops are
+    still alive. A load balancer or uptime monitor should treat
+    "degraded" as still-serving-traffic (fallbacks are working) but worth
+    alerting on; only "unhealthy" should trigger an actual failover.
+    """
+    from backend.config import GEMINI_API_KEY, NARAD_ADMIN_API_KEY
+
+    checks = {
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "admin_key_configured": bool(NARAD_ADMIN_API_KEY),
+        "bigquery_available": bigquery_store.BIGQUERY_AVAILABLE,
+        "gpu_active": GPU_AVAILABLE,
+        "city_pulse_loaded": state.current_pulse is not None,
+        "background_loops_alive": (
+            not _data_refresh_task.done() and not _parliament_task.done()
+            if _data_refresh_task and _parliament_task else False
+        ),
+    }
+
+    # "unhealthy" only for conditions that actually break core functionality —
+    # missing optional integrations (BigQuery, GPU) degrade gracefully by design.
+    is_unhealthy = not checks["city_pulse_loaded"] or not checks["background_loops_alive"]
+    is_degraded = not checks["gemini_configured"] or not checks["admin_key_configured"]
+
+    status = "unhealthy" if is_unhealthy else ("degraded" if is_degraded else "healthy")
+
     return {
-        "status": "healthy",
-        "gpu": GPU_AVAILABLE,
+        "status": status,
+        "checks": checks,
         "sessions_run": state.session_count,
         "connected_clients": len(state.connected_clients),
         "data_points": len(state.pulse_history),
-        "tasks": {
-            "data_refresh": not _refresh_task.done() if _refresh_task else False,
-            "parliament_loop": not _parliament_task.done() if _parliament_task else False
-        }
     }
 
 
